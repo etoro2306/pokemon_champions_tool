@@ -1,0 +1,86 @@
+# Trigger de regulación: comprueba cada día si la regulación vigente de Pokémon Champions
+# ha cambiado en Pokémon Showdown. Si cambia, regenera src/data/regulation.json, actualiza
+# el motor de daño (@smogon/calc), valida, hace commit y vuelve a desplegar la web.
+#
+# Formas de lanzarlo:
+#   - Automático: cron diario.
+#   - Manual: pestaña Actions → "Actualizar regulación" → Run workflow (opción "force").
+#   - Remoto: POST /repos/{owner}/{repo}/dispatches con {"event_type": "regulation-changed"}.
+name: Actualizar regulación
+
+on:
+  schedule:
+    - cron: '17 6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Regenerar los datos aunque no se detecten cambios'
+        type: boolean
+        default: false
+  repository_dispatch:
+    types: [regulation-changed]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-regulation
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.commit.outputs.changed }}
+      regulation: ${{ steps.reg.outputs.regulation }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Actualizar el motor de cálculo (@smogon/calc)
+        run: npm install @smogon/calc@latest --save
+
+      - name: Regenerar la lista de la regulación vigente
+        id: reg
+        run: npm run update:regulation -- ${{ inputs.force && '--force' || '' }}
+
+      - name: Validar (tipos, tests y build)
+        run: |
+          npm run typecheck
+          npm test
+          npm run build
+
+      - name: Commit y push si hay cambios
+        id: commit
+        run: |
+          if git diff --quiet -- src/data/regulation.json package.json package-lock.json; then
+            echo "Sin cambios en la regulación."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/data/regulation.json package.json package-lock.json
+          git commit -m "chore(data): regulación ${{ steps.reg.outputs.regulation }} actualizada automáticamente"
+          git push
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Resumen
+        run: |
+          echo "### Regulación ${{ steps.reg.outputs.regulation }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Cambios aplicados: ${{ steps.commit.outputs.changed }}" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    needs: update
+    if: needs.update.outputs.changed == 'true'
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    uses: ./.github/workflows/deploy.yml
